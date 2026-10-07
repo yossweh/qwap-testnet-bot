@@ -1,0 +1,18 @@
+[Unit]
+Description=Qwap Testnet Auto-Swap Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ganti User dan path sesuai lokasi install (default /opt/qwap-bot)
+User=root
+WorkingDirectory=/opt/qwap-bot
+ExecStart=/opt/qwap-bot/venv/bin/python /opt/qwap-bot/bot.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/qwap-bot.log
+StandardError=append:/var/log/qwap-bot.log
+
+[Install]
+WantedBy=multi-user.target
