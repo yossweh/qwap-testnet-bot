@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""Qwap testnet auto-swap bot.
+"""Qwap Testnet Auto Bot.
 
-Automates round-trip swaps on Qwap (UniswapV2-style AMM) on QMS Testnet
-(chain ID 19480). TESTNET ONLY — the bot refuses to run on any other chain.
+Automated swap + liquidity cycles on Qwap DEX (UniswapV2-style AMM),
+QMS Testnet (chain ID 19480). TESTNET ONLY — refuses any other chain.
 
-Strategy (default): each round does QMS -> USDT -> QMS
-  1. swap native QMS -> USDT via swapExactETHForTokens
-  2. approve USDT -> router (only when allowance is insufficient)
-  3. swap USDT -> QMS via swapExactTokensForETH
-  4. random sleep, repeat
+Each cycle per wallet:
+  1. N alternating swaps (QMS->USDT, USDT->QMS, ...)
+  2. Add liquidity (QMS + USDT)
+  3. Remove liquidity (withdraw all LP)
+  4. Optional points check (if points_url is set in config)
+
+Wallets live in ~/.config/qwap-bot/wallets.json (mode 0600):
+  [{"address": "0x...", "private_key": "..."}]
+On first run a fresh wallet is generated; fund it from
+https://faucet.testnet.qms.finance/ then re-run. Append more entries
+manually to run multiple wallets (never commit this file).
 
 Usage:
-  ./venv/bin/python bot.py                  # run with config.json strategy
-  ./venv/bin/python bot.py --dry-run        # simulate, broadcast nothing
-  ./venv/bin/python bot.py --rounds 5       # stop after 5 round trips
-  ./venv/bin/python bot.py --once           # single round trip then exit
-
-On first run a fresh wallet is generated at ~/.config/qwap-bot/wallet.json
-(mode 0600). Fund it from the faucet: https://faucet.testnet.qms.finance/
-(10 QMS per request, max 4 requests / 24h), then run again.
+  ./venv/bin/python bot.py                 # interactive prompt (cycles)
+  ./venv/bin/python bot.py --rounds 3      # 3 cycles per wallet, then exit
+  ./venv/bin/python bot.py --once          # single cycle then exit
+  ./venv/bin/python bot.py --loop-24h      # cycles, then 24h countdown, repeat
+  ./venv/bin/python bot.py --dry-run       # simulate, broadcast nothing
 """
 
 import argparse
@@ -28,20 +31,51 @@ import random
 import sys
 import time
 
+import requests
 from eth_account import Account
 from web3 import Web3
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
-WALLET_PATH = os.path.expanduser("~/.config/qwap-bot/wallet.json")
+WALLETS_PATH = os.path.expanduser("~/.config/qwap-bot/wallets.json")
+LEGACY_WALLET_PATH = os.path.expanduser("~/.config/qwap-bot/wallet.json")
 EXPLORER = "https://testnet.qmsscan.io/tx/"
 
+# ---------------------------------------------------------------- colors/log
+C = {
+    "reset": "\x1b[0m", "cyan": "\x1b[36m", "green": "\x1b[32m",
+    "yellow": "\x1b[33m", "red": "\x1b[31m", "white": "\x1b[37m",
+    "bold": "\x1b[1m", "magenta": "\x1b[35m",
+}
+
+
+def log_info(m):    print(f"{C['green']}[✓] {m}{C['reset']}")
+def log_warn(m):    print(f"{C['yellow']}[⚠] {m}{C['reset']}")
+def log_error(m):   print(f"{C['red']}[✗] {m}{C['reset']}")
+def log_ok(m):      print(f"{C['green']}[✅] {m}{C['reset']}")
+def log_load(m):    print(f"{C['cyan']}[⟳] {m}{C['reset']}")
+def log_step(m):    print(f"{C['white']}[➤] {m}{C['reset']}")
+def banner():
+    print(f"{C['cyan']}{C['bold']}")
+    print("-----------------------------------------------")
+    print("  Qwap Testnet Auto Bot")
+    print("-----------------------------------------------")
+    print(f"{C['reset']}")
+
+
+# ------------------------------------------------------------------ ABIs
 ROUTER_ABI = [
     {"name": "WQMS", "type": "function", "stateMutability": "view", "inputs": [],
+     "outputs": [{"name": "", "type": "address"}]},
+    {"name": "factory", "type": "function", "stateMutability": "view", "inputs": [],
      "outputs": [{"name": "", "type": "address"}]},
     {"name": "getAmountsOut", "type": "function", "stateMutability": "view",
      "inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "path", "type": "address[]"}],
      "outputs": [{"name": "amounts", "type": "uint256[]"}]},
+    {"name": "quote", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "amountA", "type": "uint256"}, {"name": "reserveA", "type": "uint256"},
+                {"name": "reserveB", "type": "uint256"}],
+     "outputs": [{"name": "amountB", "type": "uint256"}]},
     {"name": "swapExactETHForTokens", "type": "function", "stateMutability": "payable",
      "inputs": [{"name": "amountOutMin", "type": "uint256"}, {"name": "path", "type": "address[]"},
                 {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}],
@@ -51,6 +85,23 @@ ROUTER_ABI = [
                 {"name": "path", "type": "address[]"}, {"name": "to", "type": "address"},
                 {"name": "deadline", "type": "uint256"}],
      "outputs": [{"name": "amounts", "type": "uint256[]"}]},
+    {"name": "addLiquidityETH", "type": "function", "stateMutability": "payable",
+     "inputs": [{"name": "token", "type": "address"}, {"name": "amountTokenDesired", "type": "uint256"},
+                {"name": "amountTokenMin", "type": "uint256"}, {"name": "amountETHMin", "type": "uint256"},
+                {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}],
+     "outputs": [{"name": "amountToken", "type": "uint256"}, {"name": "amountETH", "type": "uint256"},
+                 {"name": "liquidity", "type": "uint256"}]},
+    {"name": "removeLiquidityETH", "type": "function", "stateMutability": "nonpayable",
+     "inputs": [{"name": "token", "type": "address"}, {"name": "liquidity", "type": "uint256"},
+                {"name": "amountTokenMin", "type": "uint256"}, {"name": "amountETHMin", "type": "uint256"},
+                {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}],
+     "outputs": [{"name": "amountToken", "type": "uint256"}, {"name": "amountETH", "type": "uint256"}]},
+]
+
+FACTORY_ABI = [
+    {"name": "getPair", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "tokenA", "type": "address"}, {"name": "tokenB", "type": "address"}],
+     "outputs": [{"name": "pair", "type": "address"}]},
 ]
 
 ERC20_ABI = [
@@ -67,144 +118,306 @@ ERC20_ABI = [
 ]
 
 
+# ------------------------------------------------------------------ config
 def load_config():
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
 
-def get_wallet():
-    """Load or (first run) generate the bot wallet. Key file is 0600."""
-    os.makedirs(os.path.dirname(WALLET_PATH), mode=0o700, exist_ok=True)
-    if os.path.exists(WALLET_PATH):
-        with open(WALLET_PATH) as f:
-            key = json.load(f)["private_key"]
-        return Account.from_key(key)
-    acct = Account.create()
-    with open(WALLET_PATH, "w") as f:
-        json.dump({"address": acct.address, "private_key": acct.key.hex()}, f)
-    os.chmod(WALLET_PATH, 0o600)
-    print(f"Wallet baru dibuat: {acct.address}")
-    print("Private key tersimpan di ~/.config/qwap-bot/wallet.json (mode 600, tidak ditampilkan).")
-    print("Isi saldo dari faucet https://faucet.testnet.qms.finance/ lalu jalankan lagi.")
-    sys.exit(0)
-
-
-def send_tx(w3, acct, tx, dry_run, label):
-    tx.setdefault("chainId", w3.eth.chain_id)
-    tx.setdefault("nonce", w3.eth.get_transaction_count(acct.address))
-    if "gas" not in tx:
-        tx["gas"] = int(w3.eth.estimate_gas({k: v for k, v in tx.items() if k != "gas"}) * 1.2)
-    if "gasPrice" not in tx and "maxFeePerGas" not in tx:
-        tx["gasPrice"] = w3.eth.gas_price
-    if dry_run:
-        print(f"  [DRY-RUN] {label}: {tx}")
-        return None
-    signed = acct.sign_transaction(tx)
-    h = w3.eth.send_raw_transaction(signed.raw_transaction)
-    print(f"  {label}: {h.hex()}  ({EXPLORER}{h.hex()})")
-    receipt = w3.eth.wait_for_transaction_receipt(h, timeout=120)
-    status = "OK" if receipt.status == 1 else "GAGAL"
-    print(f"    -> {status} (block {receipt.blockNumber}, gas {receipt.gasUsed})")
-    if receipt.status != 1:
-        raise RuntimeError(f"tx gagal: {h.hex()}")
-    return h.hex()
-
-
-def ensure_approval(w3, acct, token, spender, amount, dry_run):
-    t = w3.eth.contract(address=token, abi=ERC20_ABI)
-    if t.functions.allowance(acct.address, spender).call() >= amount:
-        return
-    print("  approve USDT -> router (max)")
-    tx = t.functions.approve(spender, 2**256 - 1).build_transaction({"from": acct.address})
-    send_tx(w3, acct, tx, dry_run, "approve")
-
-
-def round_trip(w3, acct, cfg, dry_run):
-    s = cfg["strategy"]
-    router = w3.eth.contract(address=cfg["router"], abi=ROUTER_ABI)
-    wqms = router.functions.WQMS().call()
-    usdt = cfg["tokens"]["USDT"]
-    to = acct.address
-    deadline = int(time.time()) + 1200
-    slip = 1 - s["slippage_pct"] / 100
-
-    # --- leg 1: QMS -> USDT ---
-    amount_in = w3.to_wei(random.uniform(s["min_amount_qms"], s["max_amount_qms"]), "ether")
-    quoted = router.functions.getAmountsOut(amount_in, [wqms, usdt]).call()[1]
-    min_out = int(quoted * slip)
-    print(f"Leg 1: {w3.from_wei(amount_in, 'ether'):.4f} QMS -> ~{quoted/1e6:.4f} USDT (min {min_out/1e6:.4f})")
-    if dry_run:
-        print(f"  [DRY-RUN] swapExactETHForTokens(amountOutMin={min_out}, path=[WQMS, USDT], to={to}) value={w3.from_wei(amount_in, 'ether'):.4f} QMS")
+def load_wallets():
+    """Return list of Account. Migrates legacy single wallet.json, else generates one."""
+    os.makedirs(os.path.dirname(WALLETS_PATH), mode=0o700, exist_ok=True)
+    if os.path.exists(WALLETS_PATH):
+        with open(WALLETS_PATH) as f:
+            data = json.load(f)
+        return [Account.from_key(e["private_key"]) for e in data]
+    entries = []
+    if os.path.exists(LEGACY_WALLET_PATH):
+        with open(LEGACY_WALLET_PATH) as f:
+            old = json.load(f)
+        entries.append({"address": old["address"], "private_key": old["private_key"]})
+        log_info(f"Wallet lama dimigrasi: {old['address']}")
     else:
-        tx = router.functions.swapExactETHForTokens(
-            min_out, [wqms, usdt], to, deadline
-        ).build_transaction({"from": to, "value": amount_in})
-        send_tx(w3, acct, tx, dry_run, "swap QMS->USDT")
+        acct = Account.create()
+        entries.append({"address": acct.address, "private_key": acct.key.hex()})
+        print(f"Wallet baru dibuat: {acct.address}")
+        print("Private key tersimpan di ~/.config/qwap-bot/wallets.json (mode 600).")
+        print("Isi saldo dari https://faucet.testnet.qms.finance/ lalu jalankan lagi.")
+    with open(WALLETS_PATH, "w") as f:
+        json.dump(entries, f)
+    os.chmod(WALLETS_PATH, 0o600)
+    if len(entries) == 1 and not os.path.exists(LEGACY_WALLET_PATH):
+        sys.exit(0)  # wallet baru -> minta funding dulu
+    return [Account.from_key(e["private_key"]) for e in entries]
 
-    # --- leg 2: USDT -> QMS ---
-    erc = w3.eth.contract(address=usdt, abi=ERC20_ABI)
-    if dry_run:
-        bal = quoted  # dummy: pakai hasil quote leg 1 agar tidak revert saat simulasi
-        print(f"Leg 2 (simulasi): {bal/1e6:.4f} USDT -> QMS")
-        quoted_back = router.functions.getAmountsOut(bal, [usdt, wqms]).call()[1]
-        print(f"  -> ~{w3.from_wei(quoted_back, 'ether'):.4f} QMS")
-        return
-    bal = erc.functions.balanceOf(to).call()
-    if bal == 0:
-        raise RuntimeError("saldo USDT 0 setelah leg 1 — berhenti")
-    ensure_approval(w3, acct, usdt, cfg["router"], bal, dry_run)
-    quoted_back = router.functions.getAmountsOut(bal, [usdt, wqms]).call()[1]
-    min_back = int(quoted_back * slip)
-    print(f"Leg 2: {bal/1e6:.4f} USDT -> ~{w3.from_wei(quoted_back, 'ether'):.4f} QMS (min {w3.from_wei(min_back, 'ether'):.4f})")
-    tx = router.functions.swapExactTokensForETH(
-        min_back, [usdt, wqms], to, deadline
-    ).build_transaction({"from": to, "value": 0})
-    send_tx(w3, acct, tx, dry_run, "swap USDT->QMS")
+
+# ------------------------------------------------------------------ chain ops
+class Bot:
+    def __init__(self, w3, acct, cfg):
+        self.w3 = w3
+        self.acct = acct
+        self.cfg = cfg
+        self.cycle_cfg = cfg["cycle"]
+        self.router = w3.eth.contract(address=cfg["router"], abi=ROUTER_ABI)
+        self.wqms = self.router.functions.WQMS().call()
+        self.usdt = cfg["tokens"]["USDT"]
+        self.usdt_c = w3.eth.contract(address=self.usdt, abi=ERC20_ABI)
+        self.slip = 1 - self.cycle_cfg["slippage_pct"] / 100
+        self.retries = self.cycle_cfg.get("max_retries", 3)
+
+    def deadline(self):
+        return int(time.time()) + 1200
+
+    def send_tx(self, tx, label):
+        w3, acct = self.w3, self.acct
+        tx.setdefault("chainId", w3.eth.chain_id)
+        tx.setdefault("nonce", w3.eth.get_transaction_count(acct.address))
+        if "gas" not in tx:
+            tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.2)
+        if "gasPrice" not in tx and "maxFeePerGas" not in tx:
+            tx["gasPrice"] = w3.eth.gas_price
+        last_err = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                signed = acct.sign_transaction(tx)
+                h = w3.eth.send_raw_transaction(signed.raw_transaction)
+                log_ok(f"{label}: {EXPLORER}{h.hex()}")
+                rcpt = w3.eth.wait_for_transaction_receipt(h, timeout=120)
+                if rcpt.status == 1:
+                    return h.hex()
+                last_err = f"tx revert {h.hex()}"
+            except Exception as e:
+                last_err = str(e)
+            log_warn(f"{label} gagal (percobaan {attempt}/{self.retries}): {last_err}")
+            tx["nonce"] = w3.eth.get_transaction_count(acct.address)
+            time.sleep(2)
+        log_error(f"{label} gagal setelah {self.retries} percobaan, lanjut.")
+        return None
+
+    def ensure_approval(self, token_c, spender, amount, dry_run):
+        if token_c.functions.allowance(self.acct.address, spender).call() >= amount:
+            return
+        log_load("Approve token -> router (max)")
+        if dry_run:
+            print("  [DRY-RUN] approve(max)")
+            return
+        tx = token_c.functions.approve(spender, 2**256 - 1).build_transaction(
+            {"from": self.acct.address})
+        self.send_tx(tx, "approve")
+
+    def qms_balance(self):
+        return self.w3.eth.get_balance(self.acct.address)
+
+    def usdt_balance(self):
+        return self.usdt_c.functions.balanceOf(self.acct.address).call()
+
+    # ------------------------------------------------------------ swaps
+    def swap_qms_to_usdt(self, amount_in, n, dry_run):
+        quoted = self.router.functions.getAmountsOut(amount_in, [self.wqms, self.usdt]).call()[1]
+        min_out = int(quoted * self.slip)
+        log_load(f"Swap {n}: {self.w3.from_wei(amount_in, 'ether'):.5f} QMS -> USDT "
+                 f"(~{quoted/1e6:.4f}, min {min_out/1e6:.4f})")
+        if dry_run:
+            print(f"  [DRY-RUN] swapExactETHForTokens value={self.w3.from_wei(amount_in, 'ether'):.5f} QMS")
+            return True
+        tx = self.router.functions.swapExactETHForTokens(
+            min_out, [self.wqms, self.usdt], self.acct.address, self.deadline()
+        ).build_transaction({"from": self.acct.address, "value": amount_in})
+        return self.send_tx(tx, f"Swap {n} QMS->USDT") is not None
+
+    def swap_usdt_to_qms(self, amount_in, n, dry_run):
+        quoted = self.router.functions.getAmountsOut(amount_in, [self.usdt, self.wqms]).call()[1]
+        min_out = int(quoted * self.slip)
+        log_load(f"Swap {n}: {amount_in/1e6:.4f} USDT -> QMS "
+                 f"(~{self.w3.from_wei(quoted, 'ether'):.5f}, min {self.w3.from_wei(min_out, 'ether'):.5f})")
+        if dry_run:
+            print("  [DRY-RUN] swapExactTokensForETH")
+            return True
+        self.ensure_approval(self.usdt_c, self.cfg["router"], amount_in, dry_run)
+        tx = self.router.functions.swapExactTokensForETH(
+            min_out, [self.usdt, self.wqms], self.acct.address, self.deadline()
+        ).build_transaction({"from": self.acct.address})
+        return self.send_tx(tx, f"Swap {n} USDT->QMS") is not None
+
+    # ------------------------------------------------------------ liquidity
+    def add_liquidity(self, dry_run):
+        cc = self.cycle_cfg
+        qms_amt = self.w3.to_wei(cc["liquidity_qms"], "ether")
+        if self.qms_balance() < qms_amt + self.w3.to_wei(0.05, "ether"):
+            log_error(f"QMS kurang untuk add liquidity ({cc['liquidity_qms']} dibutuhkan)")
+            return False
+        usdt_amt = self.router.functions.getAmountsOut(qms_amt, [self.wqms, self.usdt]).call()[1]
+        if self.usdt_balance() < usdt_amt:
+            log_warn(f"USDT kurang ({usdt_amt/1e6:.4f} dibutuhkan) — swap dulu atau kecilkan liquidity_qms")
+            return False
+        log_load(f"Add liquidity: {cc['liquidity_qms']} QMS + {usdt_amt/1e6:.4f} USDT")
+        if dry_run:
+            print("  [DRY-RUN] addLiquidityETH")
+            return True
+        self.ensure_approval(self.usdt_c, self.cfg["router"], usdt_amt, dry_run)
+        tx = self.router.functions.addLiquidityETH(
+            self.usdt, usdt_amt, int(usdt_amt * self.slip), int(qms_amt * self.slip),
+            self.acct.address, self.deadline()
+        ).build_transaction({"from": self.acct.address, "value": qms_amt})
+        return self.send_tx(tx, "Add liquidity") is not None
+
+    def remove_liquidity(self, dry_run):
+        factory = self.w3.eth.contract(
+            address=self.router.functions.factory().call(), abi=FACTORY_ABI)
+        pair_addr = factory.functions.getPair(self.wqms, self.usdt).call()
+        if int(pair_addr, 16) == 0:
+            log_warn("Pair WQMS/USDT belum ada")
+            return False
+        pair = self.w3.eth.contract(address=pair_addr, abi=ERC20_ABI)
+        lp = pair.functions.balanceOf(self.acct.address).call()
+        if lp == 0:
+            log_warn("Tidak ada LP token untuk withdraw")
+            return False
+        log_load(f"Remove liquidity: {lp} LP")
+        if dry_run:
+            print("  [DRY-RUN] removeLiquidityETH")
+            return True
+        self.ensure_approval(pair, self.cfg["router"], lp, dry_run)
+        tx = self.router.functions.removeLiquidityETH(
+            self.usdt, lp, 0, 0, self.acct.address, self.deadline()
+        ).build_transaction({"from": self.acct.address})
+        return self.send_tx(tx, "Remove liquidity") is not None
+
+    # ------------------------------------------------------------ points
+    def check_points(self):
+        url = self.cfg.get("points_url", "")
+        if not url:
+            return
+        try:
+            r = requests.get(url.format(address=self.acct.address), timeout=15)
+            log_info(f"Points: {r.text[:200]}")
+        except Exception as e:
+            log_warn(f"Gagal ambil points: {e}")
+
+    # ------------------------------------------------------------ cycle
+    def run_cycle(self, num, dry_run):
+        cc = self.cycle_cfg
+        log_step(f"--- Cycle {num} | {self.acct.address} ---")
+        q0 = self.w3.from_wei(self.qms_balance(), "ether")
+        u0 = self.usdt_balance() / 1e6
+        log_info(f"Saldo awal: {q0:.4f} QMS, {u0:.4f} USDT")
+
+        ok_swaps = 0
+        n = cc["swaps_per_cycle"]
+        for i in range(1, n + 1):
+            if i % 2 == 1:  # ganjil: QMS -> USDT
+                amt = self.w3.to_wei(random.uniform(cc["min_swap_qms"], cc["max_swap_qms"]), "ether")
+                reserve = self.w3.to_wei(0.05, "ether")
+                if not dry_run and self.qms_balance() < amt + reserve:
+                    log_warn(f"Swap {i}/{n} dilewati: QMS kurang")
+                    continue
+                if self.swap_qms_to_usdt(amt, f"{i}/{n}", dry_run):
+                    ok_swaps += 1
+            else:  # genap: USDT -> QMS
+                bal = self.usdt_balance()
+                if dry_run:
+                    bal = 10**6  # dummy 1 USDT
+                amt = min(bal, int(bal * random.uniform(0.25, 0.5)))
+                if amt < 10**4:  # < 0.01 USDT
+                    log_warn(f"Swap {i}/{n} dilewati: USDT kurang")
+                    continue
+                if self.swap_usdt_to_qms(amt, f"{i}/{n}", dry_run):
+                    ok_swaps += 1
+            time.sleep(random.uniform(1, 3))
+
+        if cc.get("add_liquidity", True):
+            time.sleep(2)
+            if self.add_liquidity(dry_run):
+                time.sleep(2)
+                self.remove_liquidity(dry_run)
+
+        self.check_points()
+        q1 = self.w3.from_wei(self.qms_balance(), "ether")
+        u1 = self.usdt_balance() / 1e6
+        log_info(f"Cycle {num} selesai: {ok_swaps}/{n} swap OK | Saldo: {q1:.4f} QMS, {u1:.4f} USDT")
+        print()
+
+
+# ------------------------------------------------------------------ main
+def countdown_24h():
+    total = 24 * 60 * 60
+    end = time.time() + total
+    while time.time() < end:
+        rem = int(end - time.time())
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        print(f"\r{C['cyan']}[⏰] Eksekusi berikutnya dalam: {h:02d}:{m:02d}:{s:02d}{C['reset']}", end="", flush=True)
+        time.sleep(1)
+    print()
+
+
+def prompt_cycles():
+    while True:
+        try:
+            v = input("Masukkan jumlah cycle yang dijalankan: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+        if v.isdigit() and int(v) > 0:
+            return int(v)
+        log_error("Masukkan angka positif.")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Qwap testnet auto-swap bot")
-    ap.add_argument("--dry-run", action="store_true", help="simulasi tanpa broadcast")
-    ap.add_argument("--rounds", type=int, default=0, help="jumlah round trip (0 = tanpa batas)")
-    ap.add_argument("--once", action="store_true", help="satu round trip lalu berhenti")
+    ap = argparse.ArgumentParser(description="Qwap Testnet Auto Bot")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--rounds", type=int, default=0, help="jumlah cycle per wallet (0 = prompt interaktif)")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--loop-24h", action="store_true", help="ulangi cycle tiap 24 jam")
     args = ap.parse_args()
 
+    banner()
     cfg = load_config()
     w3 = Web3(Web3.HTTPProvider(cfg["rpc"], request_kwargs={"timeout": 30}))
     if not w3.is_connected():
         sys.exit("RPC tidak terhubung: " + cfg["rpc"])
     if w3.eth.chain_id != cfg["chain_id"]:
-        sys.exit(f"CHAIN ID SALAH ({w3.eth.chain_id}) — bot hanya jalan di QMS Testnet 19480. Berhenti.")
-    print(f"Tersambung: chain {w3.eth.chain_id} (QMS Testnet), block {w3.eth.block_number}")
+        sys.exit(f"CHAIN ID SALAH ({w3.eth.chain_id}) — hanya QMS Testnet 19480.")
+    log_info(f"Tersambung: chain {w3.eth.chain_id} (QMS Testnet), block {w3.eth.block_number}")
 
-    acct = get_wallet()
-    print(f"Wallet: {acct.address}")
-    bal = w3.eth.get_balance(acct.address)
-    print(f"Saldo: {w3.from_wei(bal, 'ether'):.4f} QMS")
-    need = w3.to_wei(cfg["strategy"]["min_amount_qms"] * 2, "ether")
-    if bal < need:
-        print(f"Saldo kurang (butuh ~{w3.from_wei(need, 'ether'):.2f} QMS). Isi dari https://faucet.testnet.qms.finance/")
-        if not args.dry_run:
-            sys.exit(1)
+    wallets = load_wallets()
+    log_info(f"{len(wallets)} wallet dimuat")
 
-    if args.dry_run:
-        print("== DRY-RUN ==")
-    rounds = 1 if args.once else (args.rounds or float("inf"))
-    i = 0
+    if args.once:
+        rounds = 1
+    elif args.rounds:
+        rounds = args.rounds
+    elif sys.stdin.isatty() and not args.dry_run:
+        rounds = prompt_cycles()
+    else:
+        rounds = 1 if args.dry_run else prompt_cycles()
+
+    bots = [Bot(w3, a, cfg) for a in wallets]
+    cycle = 0
     try:
-        while i < rounds:
-            i += 1
-            print(f"\n--- Round {i} ---")
-            round_trip(w3, acct, cfg, args.dry_run)
-            if i >= rounds or args.dry_run:
+        while True:
+            cycle += 1
+            for bi, bot in enumerate(bots):
+                log_step(f"Wallet {bi+1}/{len(bots)}: {bot.acct.address}")
+                try:
+                    bot.run_cycle(cycle, args.dry_run)
+                except Exception as e:
+                    log_error(f"Cycle {cycle} wallet {bi+1} error: {e}")
+                if bi < len(bots) - 1:
+                    time.sleep(3)
+            if args.dry_run or (not args.loop_24h and cycle >= rounds):
                 break
-            s = cfg["strategy"]
-            delay = random.uniform(s["min_delay_s"], s["max_delay_s"])
-            print(f"Jeda {delay:.0f} dtk...")
-            time.sleep(delay)
+            if args.loop_24h:
+                log_ok("Siklus selesai. Menunggu 24 jam...")
+                countdown_24h()
+            else:
+                cc = cfg["cycle"]
+                d = random.uniform(cc["min_delay_s"], cc["max_delay_s"])
+                log_info(f"Jeda {d:.0f} dtk sebelum cycle berikutnya...")
+                time.sleep(d)
     except KeyboardInterrupt:
         print("\nBerhenti oleh pengguna.")
-    print(f"\nSelesai: {i} round.")
+    log_ok(f"Selesai: {cycle} cycle.")
 
 
 if __name__ == "__main__":
